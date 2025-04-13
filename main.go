@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/go-redis/redis/v8"
 	"github.com/joho/godotenv"
 )
 
@@ -29,13 +31,35 @@ type Manga struct {
 
 func init() {
 	godotenv.Load()
-	manhwaSrc = os.Getenv("MANHWA_SRC_URL")
-	manhwaList = []string{
-		os.Getenv("DRAGON_SLAYER_MANGA"),
-		os.Getenv("KNIGHT_KING_WHO_RETURNED_WITH_GOD_MANGA"),
+	ctx := context.Background()
+	client, err := initializeRedis(ctx)
+	if err != nil {
+		panic(err)
 	}
+	vals, err := client.LRange(ctx, os.Getenv("MANHWA_LIST_KEY"), 0, -1).Result()
+	if err != nil {
+		panic(err)
+	}
+	manhwaList = vals
+	manhwaSrc = os.Getenv("MANHWA_SRC_URL")
 	mangaPriSrc = os.Getenv("MANGA_PRI_SRC_URL")
 	mangaSecSrc = os.Getenv("MANGA_SEC_SRC_URL")
+}
+
+func initializeRedis(ctx context.Context) (*redis.Client, error) {
+	client := redis.NewClient(&redis.Options{
+		Addr:     os.Getenv("REDIS_ADDR"),
+		Password: os.Getenv("REDIS_PASSWORD"),
+		DB:       0,
+	})
+	// ping redis server
+	pong, err := client.Ping(ctx).Result()
+	fmt.Println(pong, err)
+	if err != nil {
+		return nil, err
+	}
+	return client, nil
+
 }
 
 func main() {
@@ -63,50 +87,58 @@ func main() {
 		go func(manga Manga) {
 			defer wg.Done()
 			newChapterPublished := false
+			var url string
 			if manga.mangaType == "manhwa" {
-				newChapterPublished = processManhwa(manga)
+				newChapterPublished, url = processManhwa(manga)
 			} else if manga.mangaType == "manga" {
-				newChapterPublished = processManga(manga)
+				newChapterPublished, url = processManga(manga)
 			}
 
 			if newChapterPublished {
-				go notifyUser(manga)
+				go notifyUser(manga, url)
 			}
 		}(manga)
 	}
 
 	wg.Wait()
+	select {}
 }
 
-func notifyUser(manga Manga) {
+func notifyUser(manga Manga, url string) {
 	fmt.Println("manga: ", manga.mangaName)
 	fmt.Println("chapter: ", manga.latestChapterRead+1)
+	fmt.Println("url: ", url)
 	// TODO
 }
 
-func processManhwa(manga Manga) bool {
+func processManhwa(manga Manga) (bool, string) {
 	mangaAvailable, manhwaName := isManhwaPresent(manga.mangaName)
 	if !mangaAvailable {
-		return false
+		return false, ""
 	}
 
 	return newMangaChapterAvailable(manhwaSrc, manga.latestChapterRead, manhwaName)
 }
 
-func processManga(manga Manga) bool {
+func processManga(manga Manga) (bool, string) {
 	manga.mangaName = formatMangaName(manga.mangaName)
-	return newMangaChapterAvailable(mangaPriSrc, manga.latestChapterRead, manga.mangaName) || newMangaChapterAvailable(mangaSecSrc, manga.latestChapterRead, manga.mangaName)
+	priSrcAvailable, url := newMangaChapterAvailable(mangaPriSrc, manga.latestChapterRead, manga.mangaName)
+	if priSrcAvailable {
+		return true, url
+	}
+
+	return newMangaChapterAvailable(mangaSecSrc, manga.latestChapterRead, manga.mangaName)
 }
 
-func newMangaChapterAvailable(mangaSrc string, latestChapterRead int, mangaName string) bool {
+func newMangaChapterAvailable(mangaSrc string, latestChapterRead int, mangaName string) (bool, string) {
 	mangaUrl = formatMangaUrl(mangaSrc, latestChapterRead, mangaName)
 	resp, err = http.Get(mangaUrl)
 
 	if isValidResponse(resp, err) {
 		// latest chapter found
-		return true
+		return true, resp.Request.URL.String()
 	}
-	return false
+	return false, ""
 }
 
 func formatManhwaName(mangaName string) string {
